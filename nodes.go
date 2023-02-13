@@ -1,4 +1,4 @@
-/* Copyright 2017 Victor Penso, Matteo Dessalvi
+/* Copyright 2021 Chris Read
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -16,174 +16,144 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>. */
 package main
 
 import (
-	"github.com/prometheus/client_golang/prometheus"
-	"io/ioutil"
 	"log"
 	"os/exec"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
-type NodesMetrics struct {
-	alloc float64
-	comp  float64
-	down  float64
-	drain float64
-	err   float64
-	fail  float64
-	idle  float64
-	maint float64
-	mix   float64
-	resv  float64
+// NodeMetrics stores metrics for each node
+type NodeMetrics struct {
+	memAlloc   uint64
+	memTotal   uint64
+	cpuAlloc   uint64
+	cpuIdle    uint64
+	cpuOther   uint64
+	cpuTotal   uint64
+	gpuAlloc   uint64
+	gpuTotal   uint64
+	nodeStatus string
 }
 
-func NodesGetMetrics() *NodesMetrics {
-	return ParseNodesMetrics(NodesData())
+func NodeGetMetrics() map[string]*NodeMetrics {
+	return ParseNodeMetrics(NodeData())
 }
 
-func RemoveDuplicates(s []string) []string {
-	m := map[string]bool{}
-	t := []string{}
-
-	// Walk through the slice 's' and for each value we haven't seen so far, append it to 't'.
-	for _, v := range s {
-		if _, seen := m[v]; !seen {
-			if len(v) > 0 {
-				t = append(t, v)
-				m[v] = true
-			}
-		}
-	}
-
-	return t
-}
-
-func ParseNodesMetrics(input []byte) *NodesMetrics {
-	var nm NodesMetrics
+// ParseNodeMetrics takes the output of sinfo with node data
+// It returns a map of metrics per node
+func ParseNodeMetrics(input []byte) map[string]*NodeMetrics {
+	nodes := make(map[string]*NodeMetrics)
 	lines := strings.Split(string(input), "\n")
 
 	// Sort and remove all the duplicates from the 'sinfo' output
 	sort.Strings(lines)
-	lines_uniq := RemoveDuplicates(lines)
+	linesUniq := RemoveDuplicates(lines)
 
-	for _, line := range lines_uniq {
-		if strings.Contains(line, ",") {
-			split := strings.Split(line, ",")
-			count, _ := strconv.ParseFloat(strings.TrimSpace(split[0]), 64)
-			state := split[1]
-			alloc := regexp.MustCompile(`^alloc`)
-			comp := regexp.MustCompile(`^comp`)
-			down := regexp.MustCompile(`^down`)
-			drain := regexp.MustCompile(`^drain`)
-			fail := regexp.MustCompile(`^fail`)
-			err := regexp.MustCompile(`^err`)
-			idle := regexp.MustCompile(`^idle`)
-			maint := regexp.MustCompile(`^maint`)
-			mix := regexp.MustCompile(`^mix`)
-			resv := regexp.MustCompile(`^res`)
-			switch {
-			case alloc.MatchString(state) == true:
-				nm.alloc += count
-			case comp.MatchString(state) == true:
-				nm.comp += count
-			case down.MatchString(state) == true:
-				nm.down += count
-			case drain.MatchString(state) == true:
-				nm.drain += count
-			case fail.MatchString(state) == true:
-				nm.fail += count
-			case err.MatchString(state) == true:
-				nm.err += count
-			case idle.MatchString(state) == true:
-				nm.idle += count
-			case maint.MatchString(state) == true:
-				nm.maint += count
-			case mix.MatchString(state) == true:
-				nm.mix += count
-			case resv.MatchString(state) == true:
-				nm.resv += count
-			}
+	for _, line := range linesUniq {
+		node := strings.Fields(line)
+		nodeName := node[0]
+		nodeStatus := node[4] // mixed, allocated, etc.
+		nodeGpu := node[5]    // either (null) or gpu:gputype:1
+
+		nodes[nodeName] = &NodeMetrics{0, 0, 0, 0, 0, 0, 0, 0, ""}
+
+		memAlloc, _ := strconv.ParseUint(node[1], 10, 64)
+		memTotal, _ := strconv.ParseUint(node[2], 10, 64)
+
+		cpuInfo := strings.Split(node[3], "/")
+		cpuAlloc, _ := strconv.ParseUint(cpuInfo[0], 10, 64)
+		cpuIdle, _ := strconv.ParseUint(cpuInfo[1], 10, 64)
+		cpuOther, _ := strconv.ParseUint(cpuInfo[2], 10, 64)
+		cpuTotal, _ := strconv.ParseUint(cpuInfo[3], 10, 64)
+
+		if nodeGpu != "(null)" {
+			availableGRES := strings.Split(strings.Split(node[5], "(")[0], ":")
+			usedGRES := strings.Split(strings.Split(node[6], "(")[0], ":")
+			gpuTotal, _ := strconv.ParseUint(availableGRES[2], 10, 64)
+			gpuAlloc, _ := strconv.ParseUint(usedGRES[2], 10, 64)
+
+			nodes[nodeName].gpuAlloc = gpuAlloc
+			nodes[nodeName].gpuTotal = gpuTotal
 		}
+
+		nodes[nodeName].memAlloc = memAlloc
+		nodes[nodeName].memTotal = memTotal
+		nodes[nodeName].cpuAlloc = cpuAlloc
+		nodes[nodeName].cpuIdle = cpuIdle
+		nodes[nodeName].cpuOther = cpuOther
+		nodes[nodeName].cpuTotal = cpuTotal
+		nodes[nodeName].nodeStatus = nodeStatus
 	}
-	return &nm
+
+	return nodes
 }
 
-// Execute the sinfo command and return its output
-func NodesData() []byte {
-	cmd := exec.Command("sinfo", "-h", "-o %D,%T")
-	stdout, err := cmd.StdoutPipe()
+// NodeData executes the sinfo command to get data for each node
+// It returns the output of the sinfo command
+func NodeData() []byte {
+	cmd := exec.Command("sinfo", "-h", "-N", "-O", "NodeList: ,AllocMem: ,Memory: ,CPUsState: ,StateLong: ,Gres: ,GresUsed:")
+	out, err := cmd.Output()
 	if err != nil {
-		log.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		log.Fatal(err)
-	}
-	out, _ := ioutil.ReadAll(stdout)
-	if err := cmd.Wait(); err != nil {
 		log.Fatal(err)
 	}
 	return out
 }
 
-/*
- * Implement the Prometheus Collector interface and feed the
- * Slurm scheduler metrics into it.
- * https://godoc.org/github.com/prometheus/client_golang/prometheus#Collector
- */
+type NodeCollector struct {
+	cpuAlloc *prometheus.Desc
+	cpuIdle  *prometheus.Desc
+	cpuOther *prometheus.Desc
+	cpuTotal *prometheus.Desc
+	memAlloc *prometheus.Desc
+	memTotal *prometheus.Desc
+	gpuAlloc *prometheus.Desc
+	gpuTotal *prometheus.Desc
+}
 
-func NewNodesCollector() *NodesCollector {
-	return &NodesCollector{
-		alloc: prometheus.NewDesc("slurm_nodes_alloc", "Allocated nodes", nil, nil),
-		comp:  prometheus.NewDesc("slurm_nodes_comp", "Completing nodes", nil, nil),
-		down:  prometheus.NewDesc("slurm_nodes_down", "Down nodes", nil, nil),
-		drain: prometheus.NewDesc("slurm_nodes_drain", "Drain nodes", nil, nil),
-		err:   prometheus.NewDesc("slurm_nodes_err", "Error nodes", nil, nil),
-		fail:  prometheus.NewDesc("slurm_nodes_fail", "Fail nodes", nil, nil),
-		idle:  prometheus.NewDesc("slurm_nodes_idle", "Idle nodes", nil, nil),
-		maint: prometheus.NewDesc("slurm_nodes_maint", "Maint nodes", nil, nil),
-		mix:   prometheus.NewDesc("slurm_nodes_mix", "Mix nodes", nil, nil),
-		resv:  prometheus.NewDesc("slurm_nodes_resv", "Reserved nodes", nil, nil),
+// NewNodeCollector creates a Prometheus collector to keep all our stats in
+// It returns a set of collections for consumption
+func NewNodeCollector() *NodeCollector {
+	labels := []string{"node", "status"}
+
+	return &NodeCollector{
+		cpuAlloc: prometheus.NewDesc("slurm_node_cpu_alloc", "Allocated CPUs per node", labels, nil),
+		cpuIdle:  prometheus.NewDesc("slurm_node_cpu_idle", "Idle CPUs per node", labels, nil),
+		cpuOther: prometheus.NewDesc("slurm_node_cpu_other", "Other CPUs per node", labels, nil),
+		cpuTotal: prometheus.NewDesc("slurm_node_cpu_total", "Total CPUs per node", labels, nil),
+		memAlloc: prometheus.NewDesc("slurm_node_mem_alloc", "Allocated memory per node", labels, nil),
+		memTotal: prometheus.NewDesc("slurm_node_mem_total", "Total memory per node", labels, nil),
+		gpuAlloc: prometheus.NewDesc("slurm_node_gpu_alloc", "Allocated GPUs per node", labels, nil),
+		gpuTotal: prometheus.NewDesc("slurm_node_gpu_total", "Total GPUs per node", labels, nil),
 	}
 }
 
-type NodesCollector struct {
-	alloc *prometheus.Desc
-	comp  *prometheus.Desc
-	down  *prometheus.Desc
-	drain *prometheus.Desc
-	err   *prometheus.Desc
-	fail  *prometheus.Desc
-	idle  *prometheus.Desc
-	maint *prometheus.Desc
-	mix   *prometheus.Desc
-	resv  *prometheus.Desc
+// Send all metric descriptions
+func (nc *NodeCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- nc.cpuAlloc
+	ch <- nc.cpuIdle
+	ch <- nc.cpuOther
+	ch <- nc.cpuTotal
+	ch <- nc.memAlloc
+	ch <- nc.memTotal
+	ch <- nc.gpuAlloc
+	ch <- nc.gpuTotal
 }
 
-// Send all metric descriptions
-func (nc *NodesCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- nc.alloc
-	ch <- nc.comp
-	ch <- nc.down
-	ch <- nc.drain
-	ch <- nc.err
-	ch <- nc.fail
-	ch <- nc.idle
-	ch <- nc.maint
-	ch <- nc.mix
-	ch <- nc.resv
-}
-func (nc *NodesCollector) Collect(ch chan<- prometheus.Metric) {
-	nm := NodesGetMetrics()
-	ch <- prometheus.MustNewConstMetric(nc.alloc, prometheus.GaugeValue, nm.alloc)
-	ch <- prometheus.MustNewConstMetric(nc.comp, prometheus.GaugeValue, nm.comp)
-	ch <- prometheus.MustNewConstMetric(nc.down, prometheus.GaugeValue, nm.down)
-	ch <- prometheus.MustNewConstMetric(nc.drain, prometheus.GaugeValue, nm.drain)
-	ch <- prometheus.MustNewConstMetric(nc.err, prometheus.GaugeValue, nm.err)
-	ch <- prometheus.MustNewConstMetric(nc.fail, prometheus.GaugeValue, nm.fail)
-	ch <- prometheus.MustNewConstMetric(nc.idle, prometheus.GaugeValue, nm.idle)
-	ch <- prometheus.MustNewConstMetric(nc.maint, prometheus.GaugeValue, nm.maint)
-	ch <- prometheus.MustNewConstMetric(nc.mix, prometheus.GaugeValue, nm.mix)
-	ch <- prometheus.MustNewConstMetric(nc.resv, prometheus.GaugeValue, nm.resv)
+func (nc *NodeCollector) Collect(ch chan<- prometheus.Metric) {
+	nodes := NodeGetMetrics()
+	for node := range nodes {
+		ch <- prometheus.MustNewConstMetric(nc.cpuAlloc, prometheus.GaugeValue, float64(nodes[node].cpuAlloc), node, nodes[node].nodeStatus)
+		ch <- prometheus.MustNewConstMetric(nc.cpuIdle, prometheus.GaugeValue, float64(nodes[node].cpuIdle), node, nodes[node].nodeStatus)
+		ch <- prometheus.MustNewConstMetric(nc.cpuOther, prometheus.GaugeValue, float64(nodes[node].cpuOther), node, nodes[node].nodeStatus)
+		ch <- prometheus.MustNewConstMetric(nc.cpuTotal, prometheus.GaugeValue, float64(nodes[node].cpuTotal), node, nodes[node].nodeStatus)
+		ch <- prometheus.MustNewConstMetric(nc.memAlloc, prometheus.GaugeValue, float64(nodes[node].memAlloc), node, nodes[node].nodeStatus)
+		ch <- prometheus.MustNewConstMetric(nc.memTotal, prometheus.GaugeValue, float64(nodes[node].memTotal), node, nodes[node].nodeStatus)
+		if nodes[node].gpuTotal != 0 {
+			ch <- prometheus.MustNewConstMetric(nc.gpuAlloc, prometheus.GaugeValue, float64(nodes[node].gpuAlloc), node, nodes[node].nodeStatus)
+			ch <- prometheus.MustNewConstMetric(nc.gpuTotal, prometheus.GaugeValue, float64(nodes[node].gpuTotal), node, nodes[node].nodeStatus)
+		}
+	}
 }
